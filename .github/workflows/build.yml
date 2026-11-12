@@ -1,0 +1,107 @@
+name: Build debug APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      # Extracts the newest project .zip in the repo (no manual unzip needed), or uses plain project files if no zip exists.
+      - name: Locate Gradle project
+        shell: bash
+        run: |
+          set -e
+          BEST=""
+          while IFS= read -r z; do
+            if unzip -l "$z" | grep -qE 'settings\.gradle(\.kts)?$'; then
+              BEST="$z"
+            fi
+          done < <(find . -maxdepth 3 -iname '*.zip' -not -path './.git/*' | sort -V)
+          SEARCH="."
+          if [ -n "$BEST" ]; then
+            echo "Using archive: $BEST"
+            rm -rf "$RUNNER_TEMP/proj"
+            mkdir -p "$RUNNER_TEMP/proj"
+            unzip -qo "$BEST" -d "$RUNNER_TEMP/proj"
+            SEARCH="$RUNNER_TEMP/proj"
+          fi
+          S=$(find "$SEARCH" -type f \( -name 'settings.gradle.kts' -o -name 'settings.gradle' \) -not -path '*/.git/*' | awk -F/ '{print NF" "$0}' | sort -n | head -1 | cut -d' ' -f2-)
+          if [ -z "$S" ]; then
+            echo "ERROR: no settings.gradle(.kts) found. Repo tree:"
+            find . -maxdepth 3 -not -path './.git/*' | head -60
+            exit 1
+          fi
+          DIR=$(dirname "$S")
+          echo "Gradle project dir: $DIR"
+          echo "PROJECT_DIR=$DIR" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+
+      # OPTIONAL: fixed signing key so Google Sign-In works. Skipped when secrets are absent.
+      - name: Prepare signing key (optional)
+        shell: bash
+        env:
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [ -n "$KS_B64" ]; then
+            echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/aura.jks"
+            echo "AURA_KEYSTORE_PATH=$RUNNER_TEMP/aura.jks" >> "$GITHUB_ENV"
+            echo "AURA_KEYSTORE_PASSWORD=$KS_PASS" >> "$GITHUB_ENV"
+            echo "AURA_KEY_ALIAS=$KS_ALIAS" >> "$GITHUB_ENV"
+            echo "AURA_KEY_PASSWORD=${KEY_PASS:-$KS_PASS}" >> "$GITHUB_ENV"
+            {
+              echo '### Signing key SHA-1 (register this in Google Cloud > Android OAuth client)'
+              echo '```'
+              keytool -list -v -keystore "$RUNNER_TEMP/aura.jks" -alias "$KS_ALIAS" -storepass "$KS_PASS" 2>/dev/null | grep -E 'SHA1|SHA256' || echo "could not read key (check alias/password)"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No signing secrets: using the default debug key."
+          fi
+
+      - name: Build debug APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        env:
+          ORG_GRADLE_PROJECT_AURA_BACKEND_URL: ${{ vars.AURA_BACKEND_URL }}
+          ORG_GRADLE_PROJECT_GOOGLE_WEB_CLIENT_ID: ${{ vars.GOOGLE_WEB_CLIENT_ID }}
+        run: |
+          set +e
+          gradle assembleDebug --console=plain > build.log 2>&1
+          code=$?
+          grep -E '^e: ' build.log | sed -E 's#file:///home/runner/work/[^/]+/[^/]+/##' > errors.txt
+          {
+            echo '### Kotlin errors'
+            echo '```'
+            cat errors.txt
+            echo '```'
+            echo '### Other failure lines'
+            echo '```'
+            grep -E 'What went wrong|error:|FAILED|Unresolved|AAPT|Could not resolve' build.log | head -30
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat errors.txt
+          exit $code
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: AuraGlass-apk
+          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
